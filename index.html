@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Lead Enrichment Agent</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --card:#f5f5f4; --line:#ddd; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161616; --fg:#eee; --muted:#999; --card:#222; --line:#333; --accent:#60a5fa; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { margin: 0 0 4px; font-size: 24px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > label { flex:1 1 200px; display:flex; flex-direction:column; font-size:13px; color:var(--muted); gap:4px; }
+  input, select { padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font-size:14px; }
+  button { padding:10px 18px; border:0; border-radius:8px; background:var(--accent); color:#fff; font-size:14px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.alt { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:12px 0 6px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .tablewrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; }
+  a { color:var(--accent); }
+  .err { color:#dc2626; }
+</style>
+</head>
+<body>
+<main>
+  <h1>AI Lead Enrichment Agent</h1>
+  <p class="sub">Upload company list → Gemini searches the web → decision makers, LinkedIn URLs &amp; emails</p>
+
+  <div class="card">
+    <input type="file" id="file" accept=".csv,.xlsx,.xls">
+    <div class="row" id="mapRow" style="margin-top:12px; display:none">
+      <label>Company name column <select id="companyCol"></select></label>
+      <label>Website column (optional) <select id="websiteCol"></select></label>
+      <label>Rows to process <input type="number" id="limit" min="1" value="5"></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label>Target roles <input id="roles" value="CEO, Founder, CTO, CMO, Head of Marketing, VP Sales"></label>
+      <label>Max people / company <input type="number" id="maxPeople" min="1" max="5" value="3"></label>
+      <label>App password (if you set one) <input type="password" id="password"></label>
+    </div>
+    <label style="display:block;margin-top:10px;font-size:13px;color:var(--muted)">
+      <input type="checkbox" id="guess" checked> Guess email pattern if Hunter finds nothing
+    </label>
+  </div>
+
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+    <button id="start" disabled>Start enrichment</button>
+    <button id="stop" class="alt" disabled>Stop</button>
+    <button id="dlCsv" class="alt" disabled>Download CSV</button>
+    <button id="dlXlsx" class="alt" disabled>Download Excel</button>
+  </div>
+  <div class="bar"><div id="prog"></div></div>
+  <div id="status" style="font-size:13px;color:var(--muted);min-height:20px"></div>
+
+  <div class="tablewrap" style="margin-top:12px"><table id="out"></table></div>
+</main>
+
+<script>
+let rows = [], results = [], stopFlag = false;
+const $ = id => document.getElementById(id);
+
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const wb = XLSX.read(await f.arrayBuffer());
+  rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
+  if (!rows.length) return alert("File is empty");
+  const cols = Object.keys(rows[0]);
+  $("companyCol").innerHTML = cols.map(c => `<option>${c}</option>`).join("");
+  $("websiteCol").innerHTML = `<option value="">(none)</option>` + cols.map(c => `<option>${c}</option>`).join("");
+  $("limit").value = Math.min(5, rows.length); $("limit").max = rows.length;
+  $("mapRow").style.display = "flex"; $("start").disabled = false;
+  $("status").textContent = `${rows.length} rows loaded.`;
+});
+
+$("stop").onclick = () => stopFlag = true;
+
+$("start").onclick = async () => {
+  results = []; stopFlag = false;
+  $("start").disabled = true; $("stop").disabled = false;
+  $("dlCsv").disabled = $("dlXlsx").disabled = true;
+  const n = Math.min(+$("limit").value, rows.length);
+  const cc = $("companyCol").value, wc = $("websiteCol").value;
+
+  for (let i = 0; i < n && !stopFlag; i++) {
+    const row = rows[i], company = String(row[cc]);
+    $("status").textContent = `Searching: ${company} (${i + 1}/${n})`;
+    const base = { ...row };
+    try {
+      const r = await fetch("/api/enrich", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          company, website: wc ? String(row[wc]) : "",
+          roles: $("roles").value, maxPeople: +$("maxPeople").value,
+          guess: $("guess").checked, password: $("password").value,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || r.statusText);
+      if (!d.people.length) results.push({ ...base, domain: d.domain, error: "no people found" });
+      d.people.forEach(p => results.push({ ...base, domain: d.domain, ...p, error: "" }));
+    } catch (err) {
+      results.push({ ...base, error: err.message });
+    }
+    $("prog").style.width = ((i + 1) / n * 100) + "%";
+    render();
+  }
+  $("status").textContent = stopFlag ? "Stopped." : "Done!";
+  $("start").disabled = false; $("stop").disabled = true;
+  $("dlCsv").disabled = $("dlXlsx").disabled = !results.length;
+};
+
+function render() {
+  const cols = [...new Set(results.flatMap(r => Object.keys(r)))];
+  const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+  const cell = (k, v) => /^https?:/.test(v) ? `<a href="${esc(v)}" target="_blank" rel="noopener">link</a>`
+    : k === "error" && v ? `<span class="err">${esc(v)}</span>` : esc(v);
+  $("out").innerHTML = "<tr>" + cols.map(c => `<th>${esc(c)}</th>`).join("") + "</tr>" +
+    results.map(r => "<tr>" + cols.map(c => `<td>${cell(c, r[c])}</td>`).join("") + "</tr>").join("");
+}
+
+function book() {
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(results), "Enriched");
+  return wb;
+}
+$("dlXlsx").onclick = () => XLSX.writeFile(book(), "enriched_leads.xlsx");
+$("dlCsv").onclick = () => XLSX.writeFile(book(), "enriched_leads.csv", { bookType: "csv" });
+</script>
+</body>
+</html>
